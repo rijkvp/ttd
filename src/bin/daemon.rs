@@ -6,11 +6,12 @@ use std::sync::Mutex;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
-use ttd::{socket::SocketServer, Activity, Message, APP_NAME};
+use ttd::{APP_NAME, Activity, IpcMessage, socket::SocketServer};
+use ttd::{Event, Status};
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct Config {
@@ -35,11 +36,11 @@ impl Config {
     }
 }
 
-struct ActivityLog {
+struct TimeLog {
     file: File,
 }
 
-impl ActivityLog {
+impl TimeLog {
     fn init() -> Result<Self> {
         let path = dirs::data_local_dir()
             .context("no data local dir")?
@@ -50,43 +51,44 @@ impl ActivityLog {
         let file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path.join("activity_log"))
-            .context("failed to open activity log file")?;
+            .open(path.join("time_log"))
+            .context("failed to open time log file")?;
         let mut log = Self { file };
-        log.log("start")?;
+        log.log(Event::Power(true))?;
         Ok(log)
     }
 
-    fn log(&mut self, key: &str) -> Result<()> {
-        debug_assert!(!key.contains(' '), "key must not contain spaces");
+    fn log(&mut self, event: Event) -> Result<()> {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("time went backwards")?
             .as_secs();
-        writeln!(self.file, "{} {}", timestamp, key)?;
+        writeln!(self.file, "{timestamp} {event}")?;
 
         Ok(())
     }
 }
 
-impl Drop for ActivityLog {
+impl Drop for TimeLog {
     fn drop(&mut self) {
         log::info!("saving activity log");
-        self.log("stop").unwrap();
+        self.log(Event::Power(false)).unwrap();
     }
 }
 
 struct Daemon {
     config: Config,
-    activity_log: ActivityLog,
+    activity_log: TimeLog,
+    since: SystemTime,
     current: Option<Activity>,
 }
 
 impl Daemon {
-    fn new(config: Config, activity_log: ActivityLog) -> Self {
+    fn new(config: Config, activity_log: TimeLog) -> Self {
         Self {
             config,
             activity_log,
+            since: SystemTime::now(),
             current: None,
         }
     }
@@ -110,7 +112,7 @@ impl Daemon {
             let daemon = daemon.clone();
             move || loop {
                 if let Err(e) = server.handle(|msg| {
-                    let msg: Message = rmp_serde::from_read(msg).ok()?;
+                    let msg: IpcMessage = rmp_serde::from_read(msg).ok()?;
                     daemon.lock().unwrap().as_mut().unwrap().handle_msg(msg)
                 }) {
                     log::error!("server error: {}", e);
@@ -124,21 +126,38 @@ impl Daemon {
         Ok(())
     }
 
-    fn handle_msg(&mut self, msg: Message) -> Option<Vec<u8>> {
+    fn handle_msg(&mut self, msg: IpcMessage) -> Option<Vec<u8>> {
         match msg {
-            Message::GetList => Some(rmp_serde::to_vec(&self.config.activities).unwrap()),
-            Message::Switch(key) => {
-                if Some(&key) != self.current.as_ref().map(|a| &a.id) {
-                    if let Some(activity) = self.config.activities.iter().find(|a| a.id == key) {
-                        log::info!("switching to {:?}", activity);
-                        self.activity_log.log(&key).unwrap();
-                        self.current = Some(activity.clone());
+            IpcMessage::List => Some(rmp_serde::to_vec(&self.config.activities).unwrap()),
+            IpcMessage::Switch(new) => {
+                if new != self.current {
+                    if let Some(new_activity) = new {
+                        if self.config.activities.iter().any(|a| *a == new_activity) {
+                            log::info!("switching to {}", new_activity);
+                            self.activity_log
+                                .log(Event::SwitchActivity(Some(new_activity.clone())))
+                                .unwrap();
+                            self.current = Some(new_activity);
+                            self.since = SystemTime::now();
+                        } else {
+                            log::error!("unknown activity: {}", new_activity);
+                        }
                     } else {
-                        log::warn!("unknown activity: {}", key);
+                        log::info!("switching to no activity");
+                        self.activity_log.log(Event::SwitchActivity(None)).unwrap();
+                        self.current = None;
+                        self.since = SystemTime::now();
                     }
                 }
                 None
             }
+            IpcMessage::Status => Some(
+                rmp_serde::to_vec(&Status::new(
+                    self.current.clone(),
+                    self.since.elapsed().expect("time went backwards"),
+                ))
+                .unwrap(),
+            ),
         }
     }
 }
@@ -149,7 +168,7 @@ fn main() -> Result<()> {
         .parse_default_env()
         .init();
     let config = Config::load().expect("failed to load config");
-    let activity_log = ActivityLog::init().expect("failed to init activity log");
+    let activity_log = TimeLog::init().expect("failed to init activity log");
 
     Daemon::new(config, activity_log).run()?;
     Ok(())

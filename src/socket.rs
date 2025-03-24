@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine};
+use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
@@ -96,7 +96,7 @@ impl SocketClient {
 
     pub fn send(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
         self.try_send(msg)?
-            .ok_or_else(|| anyhow!("Empty response: server error"))
+            .ok_or_else(|| anyhow!("empty response: server error"))
     }
 }
 

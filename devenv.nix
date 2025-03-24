@@ -7,11 +7,19 @@
     pkgs.cargo-edit
   ];
 
-  languages.rust.enable = true;
+  languages.rust = {
+    enable = true;
+    channel = "stable";
+  };
 
   git-hooks.hooks = {
     rustfmt.enable = true;
-    clippy.enable = true;
-    clippy.settings.allFeatures = true;
+    clippy = {
+      enable = true;
+      settings = {
+        allFeatures = true;
+        denyWarnings = true;
+      };
+    };
   };
 }
