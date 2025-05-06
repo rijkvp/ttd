@@ -6,10 +6,25 @@ use std::{
     fmt::{self, Display},
     path::PathBuf,
     str::FromStr,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 pub const APP_NAME: &str = env!("CARGO_PKG_NAME");
+pub const ACTIVITY_DAEMON_NAME: &str = "actived";
+
+pub fn activity_daemon_socket() -> PathBuf {
+    PathBuf::from("/run")
+        .join(APP_NAME)
+        .join(ACTIVITY_DAEMON_NAME)
+        .with_extension("sock")
+}
+
+pub fn get_unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
 
 #[derive(Debug, Clone)]
 pub enum Event {

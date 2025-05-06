@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use signal_hook::consts::TERM_SIGNALS;
 use signal_hook::iterator::Signals;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -10,8 +12,21 @@ use std::{
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
+use ttd::socket::SocketClient;
 use ttd::{APP_NAME, Activity, IpcMessage, socket::SocketServer};
-use ttd::{Event, Status};
+use ttd::{Event, Status, get_unix_time};
+
+fn main() -> Result<()> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
+        .init();
+    let config = Config::load().expect("failed to load config");
+    let activity_log = TimeLog::init().expect("failed to init activity log");
+
+    Daemon::new(config, activity_log).run()?;
+    Ok(())
+}
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 struct Config {
@@ -96,6 +111,31 @@ impl Daemon {
     fn run(self) -> Result<()> {
         let mut server = SocketServer::create(ttd::socket_path(), false)?;
 
+        let mut activity_client = SocketClient::connect(ttd::activity_daemon_socket())
+            .context("failed to connect to activity client")?;
+
+        let last_active = Arc::new(AtomicU64::new(get_unix_time()));
+        thread::spawn({
+            let last_active = last_active.clone();
+            move || loop {
+                if let Err(e) = activity_client.receive(|_| {
+                    log::info!("active at {last_active:?}");
+                    last_active.store(get_unix_time(), Ordering::Relaxed);
+                }) {
+                    log::error!("activity client error: {}", e);
+                }
+            }
+        });
+        thread::spawn(move || {
+            loop {
+                let elapsed = get_unix_time() - last_active.load(Ordering::Relaxed);
+                if elapsed > 5 {
+                    log::info!("no activity for 5 seconds");
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
+
         let daemon = Arc::new(Mutex::new(Some(self)));
 
         let (tx, rx) = mpsc::channel();
@@ -160,16 +200,4 @@ impl Daemon {
             ),
         }
     }
-}
-
-fn main() -> Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .parse_default_env()
-        .init();
-    let config = Config::load().expect("failed to load config");
-    let activity_log = TimeLog::init().expect("failed to init activity log");
-
-    Daemon::new(config, activity_log).run()?;
-    Ok(())
 }
