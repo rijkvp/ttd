@@ -11,15 +11,19 @@
   outputs =
     {
       nixpkgs,
-      flake-utils,
       crane,
+      flake-utils,
+      rust-overlay,
       ...
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = nixpkgs.legacyPackages.${system};
-        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default.override);
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ (import rust-overlay) ];
+        };
+        craneLib = (crane.mkLib pkgs).overrideToolchain (p: p.rust-bin.stable.latest.default.override { });
 
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
