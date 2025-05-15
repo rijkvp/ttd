@@ -12,11 +12,13 @@ use std::{
     thread,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use ttd::socket::SocketClient;
 use ttd::{APP_NAME, Activity, IpcMessage, socket::SocketServer};
-use ttd::{Event, Status, get_unix_time};
+use ttd::{Event, Status, async_socket, get_unix_time};
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
@@ -24,7 +26,7 @@ fn main() -> Result<()> {
     let config = Config::load().expect("failed to load config");
     let activity_log = TimeLog::init().expect("failed to init activity log");
 
-    Daemon::new(config, activity_log).run()?;
+    Daemon::new(config, activity_log).run().await?;
     Ok(())
 }
 
@@ -108,61 +110,74 @@ impl Daemon {
         }
     }
 
-    fn run(self) -> Result<()> {
-        let mut server = SocketServer::create(ttd::socket_path(), false)?;
+    async fn run(self) -> Result<()> {
+        let stream = async_socket::create_socket_stream(ttd::activity_daemon_socket()).await?;
+        stream.readable().await?;
+        let mut reader = BufReader::new(stream);
+        loop {
+            let length = reader.read_u32().await?;
+            let mut buf = vec![0; length as usize];
+            reader.read_exact(&mut buf).await?;
+            let msg: IpcMessage = rmp_serde::from_slice(&buf).unwrap();
+            log::info!("received message: {:?}", msg);
+            // self.handle_msg(msg);
+        }
 
-        let mut activity_client = SocketClient::connect(ttd::activity_daemon_socket())
-            .context("failed to connect to activity client")?;
+        // let mut server = SocketServer::create(ttd::socket_path(), false)?;
 
-        let last_active = Arc::new(AtomicU64::new(get_unix_time()));
-        thread::spawn({
-            let last_active = last_active.clone();
-            move || loop {
-                if let Err(e) = activity_client.receive(|_| {
-                    log::info!("active at {last_active:?}");
-                    last_active.store(get_unix_time(), Ordering::Relaxed);
-                }) {
-                    log::error!("activity client error: {}", e);
-                }
-            }
-        });
-        thread::spawn(move || {
-            loop {
-                let elapsed = get_unix_time() - last_active.load(Ordering::Relaxed);
-                if elapsed > 5 {
-                    log::info!("no activity for 5 seconds");
-                }
-                thread::sleep(Duration::from_secs(1));
-            }
-        });
+        // let mut activity_client = SocketClient::connect(ttd::activity_daemon_socket())
+        //     .context("failed to connect to activity client")?;
+        // let mut ac
 
-        let daemon = Arc::new(Mutex::new(Some(self)));
+        // let last_active = Arc::new(AtomicU64::new(get_unix_time()));
+        // thread::spawn({
+        //     let last_active = last_active.clone();
+        //     move || loop {
+        //         if let Err(e) = activity_client.receive(|_| {
+        //             log::info!("active at {last_active:?}");
+        //             last_active.store(get_unix_time(), Ordering::Relaxed);
+        //         }) {
+        //             log::error!("activity client error: {}", e);
+        //         }
+        //     }
+        // });
+        // thread::spawn(move || {
+        //     loop {
+        //         let elapsed = get_unix_time() - last_active.load(Ordering::Relaxed);
+        //         if elapsed > 5 {
+        //             log::info!("no activity for 5 seconds");
+        //         }
+        //         thread::sleep(Duration::from_secs(1));
+        //     }
+        // });
 
-        let (tx, rx) = mpsc::channel();
-        let mut signals = Signals::new(TERM_SIGNALS)?;
-        let handle = signals.handle();
-        thread::spawn(move || {
-            for signal in signals.forever() {
-                log::info!("received signal {:?}", signal);
-                tx.send(()).unwrap();
-            }
-        });
+        // let daemon = Arc::new(Mutex::new(Some(self)));
 
-        thread::spawn({
-            let daemon = daemon.clone();
-            move || loop {
-                if let Err(e) = server.handle(|msg| {
-                    let msg: IpcMessage = rmp_serde::from_read(msg).ok()?;
-                    daemon.lock().unwrap().as_mut().unwrap().handle_msg(msg)
-                }) {
-                    log::error!("server error: {}", e);
-                }
-            }
-        });
-        let _ = rx.recv(); // block until signal
-        log::info!("shutting down");
-        handle.close();
-        let _ = daemon.lock().unwrap().take(); // ensure daemon is dropped
+        // let (tx, rx) = mpsc::channel();
+        // let mut signals = Signals::new(TERM_SIGNALS)?;
+        // let handle = signals.handle();
+        // thread::spawn(move || {
+        //     for signal in signals.forever() {
+        //         log::info!("received signal {:?}", signal);
+        //         tx.send(()).unwrap();
+        //     }
+        // });
+
+        // thread::spawn({
+        //     let daemon = daemon.clone();
+        //     move || loop {
+        //         if let Err(e) = server.handle(|msg| {
+        //             let msg: IpcMessage = rmp_serde::from_read(msg).ok()?;
+        //             daemon.lock().unwrap().as_mut().unwrap().handle_msg(msg)
+        //         }) {
+        //             log::error!("server error: {}", e);
+        //         }
+        //     }
+        // });
+        // let _ = rx.recv(); // block until signal
+        // log::info!("shutting down");
+        // handle.close();
+        // let _ = daemon.lock().unwrap().take(); // ensure daemon is dropped
         Ok(())
     }
 
@@ -198,6 +213,10 @@ impl Daemon {
                 ))
                 .unwrap(),
             ),
+            IpcMessage::Activity(timestamp) => {
+                log::info!("activity: {}", timestamp);
+                None
+            }
         }
     }
 }

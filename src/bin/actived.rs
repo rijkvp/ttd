@@ -1,50 +1,89 @@
-/// actived is a daemon that deters if a user is 'active' or not by listening to input events.
-/// It is indented to be ran seperately since it needs root permissions to access input devices.
+/// actived is a daemon that determines if a user is 'active' or not by listening to input events.
+/// It is intended to be ran seperately since it needs root permissions to access input devices.
 use anyhow::{Result, bail};
 use evdev::{Device, EventType};
 use std::{
+    process,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Sender},
     },
-    thread,
 };
+use tokio::{io::AsyncWriteExt, sync::broadcast};
 use tokio_stream::{StreamExt, StreamMap};
-use ttd::{get_unix_time, socket::SocketServer};
+use ttd::{
+    IpcMessage, activity_daemon_socket, async_socket::create_socket_listener, get_unix_time,
+};
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
-    let (event_tx, event_rx) = mpsc::channel();
 
+    // Broadcast channel for distributing events to all clients
+    let (broadcast_tx, _) = broadcast::channel::<u64>(100);
+
+    // Last input timestamp
     let last_input = Arc::new(AtomicU64::new(get_unix_time()));
-    {
+
+    // Start input listener
+    tokio::spawn({
         let last_input = last_input.clone();
-        thread::spawn(move || {
-            start_listener(event_tx);
-        });
-        thread::spawn(move || {
-            loop {
-                if event_rx.recv().is_ok() {
-                    let timestamp = get_unix_time();
-                    log::trace!("input event received at {timestamp} ");
-                    last_input.store(timestamp, Ordering::Relaxed);
-                }
+        let broadcast_tx = broadcast_tx.clone();
+
+        async move {
+            if let Err(e) = run_input_listener(broadcast_tx, last_input).await {
+                log::error!("event listener failed: {e}");
+                process::exit(1);
+            }
+        }
+    });
+
+    let socket_path = activity_daemon_socket();
+    let listener = create_socket_listener(socket_path, true).await?;
+    log::info!("listening for client connections");
+
+    // Accept and handle clients
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let broadcast_rx = broadcast_tx.subscribe();
+        let last_input = last_input.clone();
+
+        // Spawn a new task for each client
+        tokio::spawn(async move {
+            if let Err(e) = handle_client(stream, broadcast_rx, last_input).await {
+                log::error!("client handler error: {e}");
             }
         });
     }
+}
 
-    let mut socket = SocketServer::create(ttd::activity_daemon_socket(), true)?;
-    loop {
-        let msg = bincode::encode_to_vec(
-            last_input.load(Ordering::Relaxed),
-            bincode::config::standard(),
-        )?;
-        socket.send(&msg)?;
+async fn handle_client(
+    mut stream: tokio::net::UnixStream,
+    mut broadcast_rx: broadcast::Receiver<u64>,
+    last_input: Arc<AtomicU64>,
+) -> Result<()> {
+    // Send initial status
+    let timestamp = last_input.load(Ordering::Relaxed);
+    let ipc_msg = IpcMessage::Activity(timestamp);
+    let msg = rmp_serde::to_vec(&ipc_msg)?;
+    stream.write_u32(msg.len() as u32).await?;
+    stream.write_all(&msg).await?;
+    stream.flush().await?;
+
+    // Listen for events and forward them to the client
+    while let Ok(timestamp) = broadcast_rx.recv().await {
+        let ipc_msg = IpcMessage::Activity(timestamp);
+        let msg = rmp_serde::to_vec(&ipc_msg)?;
+        log::info!("sending message: {:?}", msg);
+        stream.write_u32(msg.len() as u32).await?;
+        stream.write_all(&msg).await?;
+        stream.flush().await?;
     }
+
+    Ok(())
 }
 
 enum InputEvent {
@@ -52,19 +91,10 @@ enum InputEvent {
     Mouse,
 }
 
-fn start_listener(event_tx: Sender<InputEvent>) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    rt.block_on(async {
-        if let Err(e) = run_input_listener(event_tx).await {
-            log::error!("failed to run event listener: {e}");
-        }
-    });
-}
-
-async fn run_input_listener(event_tx: Sender<InputEvent>) -> Result<()> {
+async fn run_input_listener(
+    broadcast_tx: broadcast::Sender<u64>,
+    last_input: Arc<AtomicU64>,
+) -> Result<()> {
     let devices: Vec<Device> = evdev::enumerate()
         .map(|(_, device)| device)
         .filter(|d| {
@@ -89,10 +119,12 @@ async fn run_input_listener(event_tx: Sender<InputEvent>) -> Result<()> {
             EventType::RELATIVE | EventType::ABSOLUTE => Some(InputEvent::Mouse),
             _ => None,
         };
-        if let Some(event) = event {
-            if let Err(e) = event_tx.send(event) {
-                bail!("failed to send event: {e}");
-            }
+        if let Some(_) = event {
+            let timestamp = get_unix_time();
+            log::debug!("input event received at {timestamp}");
+
+            last_input.store(timestamp, Ordering::Relaxed);
+            let _ = broadcast_tx.send(timestamp);
         }
     }
     Ok(())

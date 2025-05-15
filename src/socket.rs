@@ -113,23 +113,22 @@ impl SocketClient {
     where
         F: FnMut(&[u8]),
     {
-        loop {
-            let mut message = Vec::new();
-            let bytes_read = self.reader.read_until(EOT, &mut message)?;
-            if bytes_read == 0 {
-                // connection closed
-                log::info!("socket connection closed!!");
-                break;
-            }
-            log::info!("received message!");
-            message.pop(); // remove EOT
-            if message.is_empty() {
-                // skip empty message
-                continue;
-            }
-            let decoded = STANDARD_NO_PAD.decode(&message)?;
-            handle(&decoded);
+        let mut message = Vec::new();
+        let bytes_read = self.reader.read_until(EOT, &mut message)?;
+        if bytes_read == 0 {
+            // connection closed
+            log::info!("socket connection closed!!");
+            return Ok(());
         }
+        log::info!("received message!");
+        message.pop(); // remove EOT
+        if message.is_empty() {
+            // skip empty message
+            log::info!("skipping empty message");
+            return Ok(());
+        }
+        let decoded = STANDARD_NO_PAD.decode(&message)?;
+        handle(&decoded);
         Ok(())
     }
 }

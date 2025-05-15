@@ -1,3 +1,4 @@
+pub mod async_socket;
 pub mod socket;
 
 use anyhow::{Result, anyhow, bail};
@@ -110,6 +111,7 @@ impl Display for Activity {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcMessage {
+    Activity(u64),
     Status,
     Switch(Option<Activity>),
     List,
