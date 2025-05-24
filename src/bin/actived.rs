@@ -1,6 +1,6 @@
 /// actived is a daemon that determines if a user is 'active' or not by listening to input events.
 /// It is intended to be ran seperately since it needs root permissions to access input devices.
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use evdev::{Device, EventType};
 use std::{
     process,
@@ -9,10 +9,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-use tokio::{io::AsyncWriteExt, sync::broadcast};
+use tokio::sync::broadcast;
 use tokio_stream::{StreamExt, StreamMap};
 use ttd::{
-    IpcMessage, activity_daemon_socket, async_socket::create_socket_listener, get_unix_time,
+    ActivityMessage, activity_daemon_socket,
+    async_socket::{SocketServer, SocketStream},
+    get_unix_time,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -41,46 +43,46 @@ async fn main() -> Result<()> {
         }
     });
 
-    let socket_path = activity_daemon_socket();
-    let listener = create_socket_listener(socket_path, true).await?;
+    let mut socket_server = SocketServer::create(activity_daemon_socket(), true)
+        .await
+        .context("failed to create socket server")?;
     log::info!("listening for client connections");
 
     // Accept and handle clients
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = socket_server.accept_client().await?;
         let broadcast_rx = broadcast_tx.subscribe();
         let last_input = last_input.clone();
 
         // Spawn a new task for each client
         tokio::spawn(async move {
             if let Err(e) = handle_client(stream, broadcast_rx, last_input).await {
-                log::error!("client handler error: {e}");
+                log::error!("client handler error: {e:?}");
             }
         });
     }
 }
 
 async fn handle_client(
-    mut stream: tokio::net::UnixStream,
+    mut stream: SocketStream,
     mut broadcast_rx: broadcast::Receiver<u64>,
     last_input: Arc<AtomicU64>,
 ) -> Result<()> {
-    // Send initial status
+    // send initial value to the client
     let timestamp = last_input.load(Ordering::Relaxed);
-    let ipc_msg = IpcMessage::Activity(timestamp);
-    let msg = rmp_serde::to_vec(&ipc_msg)?;
-    stream.write_u32(msg.len() as u32).await?;
-    stream.write_all(&msg).await?;
-    stream.flush().await?;
+    stream
+        .send(&ActivityMessage {
+            last_active: timestamp,
+        })
+        .await?;
 
     // Listen for events and forward them to the client
     while let Ok(timestamp) = broadcast_rx.recv().await {
-        let ipc_msg = IpcMessage::Activity(timestamp);
-        let msg = rmp_serde::to_vec(&ipc_msg)?;
-        log::info!("sending message: {:?}", msg);
-        stream.write_u32(msg.len() as u32).await?;
-        stream.write_all(&msg).await?;
-        stream.flush().await?;
+        stream
+            .send(&ActivityMessage {
+                last_active: timestamp,
+            })
+            .await?;
     }
 
     Ok(())
@@ -119,7 +121,7 @@ async fn run_input_listener(
             EventType::RELATIVE | EventType::ABSOLUTE => Some(InputEvent::Mouse),
             _ => None,
         };
-        if let Some(_) = event {
+        if event.is_some() {
             let timestamp = get_unix_time();
             log::debug!("input event received at {timestamp}");
 

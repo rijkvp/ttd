@@ -1,21 +1,17 @@
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use signal_hook::consts::TERM_SIGNALS;
-use signal_hook::iterator::Signals;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    sync::{Arc, mpsc},
-    thread,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use ttd::socket::SocketClient;
-use ttd::{APP_NAME, Activity, IpcMessage, socket::SocketServer};
-use ttd::{Event, Status, async_socket, get_unix_time};
+use tokio::signal::unix::{SignalKind, signal};
+use ttd::async_socket::SocketStream;
+use ttd::{
+    APP_NAME, Activity, Event, IpcRequest, Status, async_socket::SocketServer, get_unix_time,
+};
+use ttd::{ActivityMessage, IpcResponse};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -30,7 +26,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Default, Debug, Clone, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Config {
     activities: Vec<Activity>,
 }
@@ -96,8 +92,9 @@ impl Drop for TimeLog {
 struct Daemon {
     config: Config,
     activity_log: TimeLog,
-    since: SystemTime,
+    started: SystemTime,
     current: Option<Activity>,
+    last_active: u64,
 }
 
 impl Daemon {
@@ -105,95 +102,73 @@ impl Daemon {
         Self {
             config,
             activity_log,
-            since: SystemTime::now(),
+            started: SystemTime::now(),
             current: None,
+            last_active: get_unix_time(),
         }
     }
 
     async fn run(self) -> Result<()> {
-        let stream = async_socket::create_socket_stream(ttd::activity_daemon_socket()).await?;
-        stream.readable().await?;
-        let mut reader = BufReader::new(stream);
+        let mut listener = SocketServer::create(ttd::socket_path(), true)
+            .await
+            .context("failed to create socket server")?;
+        let mut activity_stream = SocketStream::connect(ttd::activity_daemon_socket()).await?;
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+        let daemon = Arc::new(Mutex::new(self));
         loop {
-            let length = reader.read_u32().await?;
-            let mut buf = vec![0; length as usize];
-            reader.read_exact(&mut buf).await?;
-            let msg: IpcMessage = rmp_serde::from_slice(&buf).unwrap();
-            log::info!("received message: {:?}", msg);
-            // self.handle_msg(msg);
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    log::info!("received SIGTERM, shutting down");
+                    break;
+                }
+                _ = sigint.recv() => {
+                    log::info!("received SIGINT, shutting down");
+                    break;
+                }
+                Ok(client_stream) = listener.accept_client() => {
+                    tokio::spawn({
+                        let daemon = daemon.clone();
+                        async move {
+                            if let Err(e) = Self::handle_client(client_stream, daemon).await {
+                                log::error!("client handler error: {e:?}");
+                            }
+                        }
+                    });
+                }
+                Ok(activity) = activity_stream.recv::<ActivityMessage>() => {
+                    let mut daemon = daemon.lock().unwrap();
+                    daemon.last_active = activity.last_active;
+                }
+            }
         }
-
-        // let mut server = SocketServer::create(ttd::socket_path(), false)?;
-
-        // let mut activity_client = SocketClient::connect(ttd::activity_daemon_socket())
-        //     .context("failed to connect to activity client")?;
-        // let mut ac
-
-        // let last_active = Arc::new(AtomicU64::new(get_unix_time()));
-        // thread::spawn({
-        //     let last_active = last_active.clone();
-        //     move || loop {
-        //         if let Err(e) = activity_client.receive(|_| {
-        //             log::info!("active at {last_active:?}");
-        //             last_active.store(get_unix_time(), Ordering::Relaxed);
-        //         }) {
-        //             log::error!("activity client error: {}", e);
-        //         }
-        //     }
-        // });
-        // thread::spawn(move || {
-        //     loop {
-        //         let elapsed = get_unix_time() - last_active.load(Ordering::Relaxed);
-        //         if elapsed > 5 {
-        //             log::info!("no activity for 5 seconds");
-        //         }
-        //         thread::sleep(Duration::from_secs(1));
-        //     }
-        // });
-
-        // let daemon = Arc::new(Mutex::new(Some(self)));
-
-        // let (tx, rx) = mpsc::channel();
-        // let mut signals = Signals::new(TERM_SIGNALS)?;
-        // let handle = signals.handle();
-        // thread::spawn(move || {
-        //     for signal in signals.forever() {
-        //         log::info!("received signal {:?}", signal);
-        //         tx.send(()).unwrap();
-        //     }
-        // });
-
-        // thread::spawn({
-        //     let daemon = daemon.clone();
-        //     move || loop {
-        //         if let Err(e) = server.handle(|msg| {
-        //             let msg: IpcMessage = rmp_serde::from_read(msg).ok()?;
-        //             daemon.lock().unwrap().as_mut().unwrap().handle_msg(msg)
-        //         }) {
-        //             log::error!("server error: {}", e);
-        //         }
-        //     }
-        // });
-        // let _ = rx.recv(); // block until signal
-        // log::info!("shutting down");
-        // handle.close();
-        // let _ = daemon.lock().unwrap().take(); // ensure daemon is dropped
         Ok(())
     }
 
-    fn handle_msg(&mut self, msg: IpcMessage) -> Option<Vec<u8>> {
-        match msg {
-            IpcMessage::List => Some(rmp_serde::to_vec(&self.config.activities).unwrap()),
-            IpcMessage::Switch(new) => {
+    async fn handle_client(mut stream: SocketStream, daemon: Arc<Mutex<Daemon>>) -> Result<()> {
+        let msg: IpcRequest = stream.recv().await?;
+        let resp = {
+            let mut daemon = daemon.lock().unwrap();
+            daemon.handle_msg(msg)?
+        };
+        stream.send(resp).await?;
+        Ok(())
+    }
+
+    fn handle_msg(&mut self, msg: IpcRequest) -> Result<IpcResponse> {
+        Ok(match msg {
+            IpcRequest::GetActivities => IpcResponse::Activities(self.config.activities.clone()),
+            IpcRequest::Switch(new) => {
                 if new != self.current {
                     if let Some(new_activity) = new {
-                        if self.config.activities.iter().any(|a| *a == new_activity) {
+                        if self.config.activities.contains(&new_activity) {
                             log::info!("switching to {}", new_activity);
                             self.activity_log
                                 .log(Event::SwitchActivity(Some(new_activity.clone())))
                                 .unwrap();
                             self.current = Some(new_activity);
-                            self.since = SystemTime::now();
+                            self.started = SystemTime::now();
                         } else {
                             log::error!("unknown activity: {}", new_activity);
                         }
@@ -201,22 +176,15 @@ impl Daemon {
                         log::info!("switching to no activity");
                         self.activity_log.log(Event::SwitchActivity(None)).unwrap();
                         self.current = None;
-                        self.since = SystemTime::now();
+                        self.started = SystemTime::now();
                     }
                 }
-                None
+                IpcResponse::Empty
             }
-            IpcMessage::Status => Some(
-                rmp_serde::to_vec(&Status::new(
-                    self.current.clone(),
-                    self.since.elapsed().expect("time went backwards"),
-                ))
-                .unwrap(),
-            ),
-            IpcMessage::Activity(timestamp) => {
-                log::info!("activity: {}", timestamp);
-                None
-            }
-        }
+            IpcRequest::Status => IpcResponse::Status(Status::new(
+                self.current.clone(),
+                self.started.elapsed().expect("time went backwards"),
+            )),
+        })
     }
 }

@@ -1,16 +1,15 @@
 use anyhow::Result;
 use clap::{Parser, command};
-use ttd::{Activity, IpcMessage, Status, socket::SocketClient};
+use ttd::{Activity, IpcRequest, IpcResponse, async_socket::SocketStream};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::builder()
         .filter_level(log::LevelFilter::Info)
         .parse_default_env()
         .init();
     let args = Args::parse();
-    let mut client = Client::new()?;
-    client.run(args.cmd)?;
-
+    Client::connect().await?.run(args.cmd).await?;
     Ok(())
 }
 
@@ -34,44 +33,52 @@ pub enum Command {
 }
 
 struct Client {
-    socket: SocketClient,
+    stream: SocketStream,
 }
 
 impl Client {
-    fn new() -> Result<Self> {
-        let socket = SocketClient::connect(ttd::socket_path())?;
-        Ok(Self { socket })
+    async fn connect() -> Result<Self> {
+        let stream = SocketStream::connect(ttd::socket_path()).await?;
+        Ok(Self { stream })
     }
 
-    fn run(&mut self, cmd: Command) -> Result<()> {
+    async fn run(&mut self, cmd: Command) -> Result<()> {
         match cmd {
             Command::List => {
-                let activities: Vec<Activity> = self.send(IpcMessage::List)?;
-                for activity in activities {
-                    println!("{}", activity);
+                if let IpcResponse::Activities(activities) =
+                    self.stream.send_and_recv(IpcRequest::GetActivities).await?
+                {
+                    for activity in activities {
+                        println!("{}", activity);
+                    }
                 }
             }
             Command::Switch { activity } => {
-                let () = self.send(IpcMessage::Switch(Some(Activity::new(activity)?)))?;
+                if !matches!(
+                    self.stream
+                        .send_and_recv(IpcRequest::Switch(Some(Activity::new(activity)?)))
+                        .await?,
+                    IpcResponse::Empty
+                ) {
+                    eprintln!("unexpected response from server");
+                }
             }
             Command::Status => {
-                let status: Status = self.send(IpcMessage::Status)?;
-                println!("{status}");
+                if let IpcResponse::Status(status) =
+                    self.stream.send_and_recv(IpcRequest::Status).await?
+                {
+                    println!("{status}");
+                }
             }
             Command::Stop => {
-                let () = self.send(IpcMessage::Switch(None))?;
+                if !matches!(
+                    self.stream.send_and_recv(IpcRequest::Switch(None)).await?,
+                    IpcResponse::Empty
+                ) {
+                    eprintln!("unexpected response from server");
+                }
             }
         };
         Ok(())
-    }
-
-    fn send<T>(&mut self, msg: IpcMessage) -> Result<T>
-    where
-        T: serde::de::DeserializeOwned,
-    {
-        let bytes: Vec<u8> = rmp_serde::to_vec(&msg)?;
-        let response = self.socket.send(&bytes)?;
-        let data: T = rmp_serde::from_read(response.as_slice())?;
-        Ok(data)
     }
 }

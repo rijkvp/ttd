@@ -1,5 +1,4 @@
 pub mod async_socket;
-pub mod socket;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -110,11 +109,22 @@ impl Display for Activity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum IpcMessage {
-    Activity(u64),
+pub struct ActivityMessage {
+    pub last_active: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcRequest {
     Status,
     Switch(Option<Activity>),
-    List,
+    GetActivities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IpcResponse {
+    Empty,
+    Status(Status),
+    Activities(Vec<Activity>),
 }
 
 pub fn socket_path() -> PathBuf {

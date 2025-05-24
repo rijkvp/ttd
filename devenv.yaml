@@ -1,8 +1,8 @@
 inputs:
+  nixpkgs:
+    url: nixpkgs/nixos-unstable
   fenix:
     url: github:nix-community/fenix
     inputs:
       nixpkgs:
         follows: nixpkgs
-  nixpkgs:
-    url: github:cachix/devenv-nixpkgs/rolling
