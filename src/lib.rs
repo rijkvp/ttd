@@ -1,9 +1,10 @@
 pub mod async_socket;
-
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Display},
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     path::PathBuf,
     str::FromStr,
     time::{Duration, SystemTime},
@@ -24,6 +25,33 @@ pub fn get_unix_time() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+#[derive(Debug, Clone)]
+pub struct TimedEvent {
+    pub timestamp: i64,
+    pub event: Event,
+}
+
+impl Display for TimedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} {}", self.timestamp, self.event)
+    }
+}
+
+impl FromStr for TimedEvent {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (timestamp, event) = s
+            .split_once(' ')
+            .ok_or_else(|| anyhow!("invalid timed event format"))?;
+        let timestamp = timestamp
+            .parse::<i64>()
+            .context("failed to parse timestamp")?;
+        let event = event.parse()?;
+        Ok(Self { timestamp, event })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,7 +112,7 @@ impl FromStr for Event {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Activity {
     key: String,
 }
@@ -174,5 +202,74 @@ impl Display for Status {
         write!(f, " ")?;
         format_duration(f, self.duration)?;
         Ok(())
+    }
+}
+
+fn activity_log_path() -> Result<PathBuf> {
+    let path = dirs::data_local_dir()
+        .context("no data local dir")?
+        .join(APP_NAME);
+    if !path.exists() {
+        fs::create_dir_all(path.parent().unwrap()).context("failed to create log dir")?;
+    }
+    Ok(path.join("time_log"))
+}
+
+pub struct ActivityLog {
+    file: File,
+}
+
+impl ActivityLog {
+    pub fn load() -> Result<Self> {
+        let path = activity_log_path().context("failed to open time log file")?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .context("failed to open time log file")?;
+        let mut log = Self { file };
+        log.log(Event::Power(true))?;
+        Ok(log)
+    }
+
+    pub fn log(&mut self, event: Event) -> Result<()> {
+        let timestamp = get_unix_time();
+        writeln!(self.file, "{timestamp} {event}")?;
+
+        Ok(())
+    }
+}
+
+impl Drop for ActivityLog {
+    fn drop(&mut self) {
+        log::info!("saving activity log");
+        self.log(Event::Power(false)).unwrap();
+    }
+}
+
+pub struct ActivityRead {
+    file: File,
+}
+
+impl ActivityRead {
+    pub fn load() -> Result<Self> {
+        let path = activity_log_path().context("failed to open time log file")?;
+        let file = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .context("failed to open time log file")?;
+        Ok(Self { file })
+    }
+
+    pub fn read(&mut self) -> Result<Vec<TimedEvent>> {
+        let mut contents = String::new();
+        self.file
+            .read_to_string(&mut contents)
+            .context("failed to read time log")?;
+        contents
+            .lines()
+            .map(str::parse)
+            .collect::<Result<Vec<TimedEvent>>>()
+            .context("failed to parse time log")
     }
 }

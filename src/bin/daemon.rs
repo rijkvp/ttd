@@ -1,17 +1,16 @@
 use anyhow::{Context, Result};
 use std::sync::Mutex;
 use std::{
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs::{self},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::SystemTime,
 };
 use tokio::signal::unix::{SignalKind, signal};
 use ttd::async_socket::SocketStream;
 use ttd::{
     APP_NAME, Activity, Event, IpcRequest, Status, async_socket::SocketServer, get_unix_time,
 };
-use ttd::{ActivityMessage, IpcResponse};
+use ttd::{ActivityLog, ActivityMessage, IpcResponse};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -20,7 +19,7 @@ async fn main() -> Result<()> {
         .parse_default_env()
         .init();
     let config = Config::load().expect("failed to load config");
-    let activity_log = TimeLog::init().expect("failed to init activity log");
+    let activity_log = ActivityLog::load().expect("failed to load activity log");
 
     Daemon::new(config, activity_log).run().await?;
     Ok(())
@@ -48,57 +47,16 @@ impl Config {
         }
     }
 }
-
-struct TimeLog {
-    file: File,
-}
-
-impl TimeLog {
-    fn init() -> Result<Self> {
-        let path = dirs::data_local_dir()
-            .context("no data local dir")?
-            .join(APP_NAME);
-        if !path.exists() {
-            fs::create_dir_all(path.parent().unwrap()).context("failed to create log dir")?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path.join("time_log"))
-            .context("failed to open time log file")?;
-        let mut log = Self { file };
-        log.log(Event::Power(true))?;
-        Ok(log)
-    }
-
-    fn log(&mut self, event: Event) -> Result<()> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("time went backwards")?
-            .as_secs();
-        writeln!(self.file, "{timestamp} {event}")?;
-
-        Ok(())
-    }
-}
-
-impl Drop for TimeLog {
-    fn drop(&mut self) {
-        log::info!("saving activity log");
-        self.log(Event::Power(false)).unwrap();
-    }
-}
-
 struct Daemon {
     config: Config,
-    activity_log: TimeLog,
+    activity_log: ActivityLog,
     started: SystemTime,
     current: Option<Activity>,
     last_active: u64,
 }
 
 impl Daemon {
-    fn new(config: Config, activity_log: TimeLog) -> Self {
+    fn new(config: Config, activity_log: ActivityLog) -> Self {
         Self {
             config,
             activity_log,
